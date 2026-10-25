@@ -29,7 +29,9 @@ python manga_ocr.py --lang japan --llm-model sakura-14b-qwen2.5-v1.0-q4km
 4. 浏览器会自动打开 http://127.0.0.1:7860，把日文漫画拖进去，等文字框出来，点"翻译"，再点"保存译图"。
 
 > 输入
->![input](assets\manga_input.jpg)
+> 
+>![input](assets/manga_input.jpg)
 >
 > 输出
->![output](assets\manga_view.png)
+> 
+>![output](/assets/manga_view.png)
