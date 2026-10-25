@@ -1,10 +1,30 @@
-python ocr.py a.png
-python ocr.py a.png b.jpg c.png
-python ocr.py D:\scans                  # 整个文件夹
-python ocr.py a.png -o result --json    # 指定输出目录并保存 JSON
-python ocr.py a.png -s http://127.0.0.1:8080/v1
+# AI漫画翻译
 
-# 带翻译启动（需要 LMStudio启动服务器）
-```cmd
+## 环境要求
+
+- Nvidia 8G+ VRAM
+
+## 安装模型
+
+1. Python3.10
+2. PaddleOCR-VL-1.6
+```
+pip install paddlepaddle paddleocr
+```
+3. LMStudio
+- 翻译：Sakura-14B-Qwen2.5-v1.0-GGUF
+```
+hf download SakuraLLM/Sakura-14B-Qwen2.5-v1.0-GGUF sakura-14b-qwen2.5-v1.0-q4km.gguf
+```
+- 备选：Hy-MT2
+
+## 部署步骤
+
+1. 打开 LM Studio，加载 Sakura。
+2. 到 Model Server 页面，把服务器状态切到 Running，确认地址是 http://127.0.0.1:1234。
+3. CMD运行：
+```
 python manga_ocr.py --lang japan --llm-model sakura-14b-qwen2.5-v1.0-q4km
 ```
+4. 浏览器会自动打开 http://127.0.0.1:7860，把日文漫画拖进去，等文字框出来，点"翻译"，再点"保存译图"。
+

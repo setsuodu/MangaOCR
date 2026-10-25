@@ -1,0 +1,21 @@
+# ==================== 通用 ====================
+.DS_Store
+*.log
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# Docker
+.dockerignore
+**/.dockerignore
+
+# 临时文件
+**/obj/
+**/temp/
+**/tmp/
+postgres_data/
+
+/manga/
+/output/
+/paddlex-cache/
