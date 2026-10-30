@@ -10,15 +10,22 @@
 然后浏览器打开 http://127.0.0.1:7860（脚本会自动打开）
 """
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
 import tempfile
 import threading
+import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -507,6 +514,73 @@ def extract_items(res):
 SYSTEM_PROMPT = "你是一个轻小说翻译模型，可以流畅通顺地以日本轻小说的风格将日文翻译成简体中文，并联系上下文正确使用人称代词，不擅自添加原文中没有的代词。"
 
 
+def _percent_encode(s: str) -> str:
+    """RFC3986 编码（阿里云签名用）。"""
+    return urllib.parse.quote(str(s), safe="~")
+
+
+def _aliyun_sign(params: dict, secret: str, method: str = "POST") -> str:
+    """计算阿里云 RPC V2 签名。"""
+    sorted_items = sorted(params.items())
+    canonical = "&".join(f"{_percent_encode(k)}={_percent_encode(v)}" for k, v in sorted_items)
+    string_to_sign = f"{method}&{_percent_encode('/')}&{_percent_encode(canonical)}"
+    key = (secret + "&").encode("utf-8")
+    dig = hmac.new(key, string_to_sign.encode("utf-8"), hashlib.sha1).digest()
+    return base64.b64encode(dig).decode("utf-8")
+
+
+def _aliyun_translate_one(text: str, ak: str, sk: str, source: str = "ja", target: str = "zh") -> str:
+    """调用阿里云机器翻译通用版 TranslateGeneral，返回译文。"""
+    if not text or not text.strip():
+        return ""
+    endpoint = "https://mt.cn-hangzhou.aliyuncs.com/"
+    params = {
+        "AccessKeyId": ak,
+        "Action": "TranslateGeneral",
+        "Format": "JSON",
+        "FormatType": "text",
+        "Scene": "general",
+        "SignatureMethod": "HMAC-SHA1",
+        "SignatureNonce": str(uuid.uuid4()),
+        "SignatureVersion": "1.0",
+        "SourceLanguage": source,
+        "SourceText": text,
+        "TargetLanguage": target,
+        "Timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "Version": "2018-10-12",
+    }
+    params["Signature"] = _aliyun_sign(params, sk, "POST")
+    body = urllib.parse.urlencode(params).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if str(data.get("Code")) != "200":
+        raise RuntimeError(f"阿里云翻译失败: {data.get('Message') or data}")
+    return (data.get("Data") or {}).get("Translated") or ""
+
+
+def translate_texts_aliyun(texts, ak, sk, source="ja", target="zh"):
+    """逐句调用阿里云通用版翻译（单次最长 5000 字符）。"""
+    out = [""] * len(texts)
+    for i, t in enumerate(texts):
+        if not t or not t.strip():
+            continue
+        # 超长简单截断，避免超限
+        src = t if len(t) <= 4800 else t[:4800]
+        try:
+            out[i] = _aliyun_translate_one(src, ak, sk, source, target)
+        except Exception as e:
+            raise RuntimeError(f"阿里云翻译第 {i + 1} 句失败: {e}") from e
+        # 轻微限速，避免 QPS 打满（通用版默认 50）
+        time.sleep(0.05)
+    return out
+
+
 def _chat(url, model, text, strict=False):
     """调 LM Studio（OpenAI 兼容接口）翻译一段文字。strict=True 时强调必须输出中文。"""
     instruction = "将下面的日文文本翻译成中文，片假名外来语也要译成中文，不要输出英文："
@@ -531,7 +605,7 @@ def _chat(url, model, text, strict=False):
         return json.loads(r.read())["choices"][0]["message"]["content"].strip()
 
 
-def translate_texts(texts, url, model):
+def translate_texts_lm(texts, url, model):
     """整页一次翻译（一行一句，模型能看到上下文）；行数对不上就退回逐句翻译。"""
     idx = [i for i, t in enumerate(texts) if t and t.strip()]
     out = [""] * len(texts)
@@ -546,7 +620,7 @@ def translate_texts(texts, url, model):
         for i in idx:
             out[i] = _chat(url, model, texts[i])
     # 原文有假名、译文却一个汉字都没有（比如把片假名外来语还原成了英文）：强调中文后重译一次
-    kana, han = re.compile(r"[぀-ヿ]"), re.compile(r"[一-鿿]")
+    kana, han = re.compile(r"[ぁ-ン]"), re.compile(r"[一-鿿]")
     for i in idx:
         if kana.search(texts[i]) and not han.search(out[i]):
             retry = _chat(url, model, texts[i], strict=True)
@@ -555,10 +629,33 @@ def translate_texts(texts, url, model):
     return out
 
 
+def translate_texts(texts, url, model, ak="", sk="", force_aliyun=False):
+    """优先 LM Studio；连不上或 force_aliyun 时走阿里云机器翻译。"""
+    if force_aliyun or not url:
+        if not (ak and sk):
+            raise RuntimeError("未配置阿里云 AccessKey（--aliyun-ak / --aliyun-sk 或环境变量 ALIBABA_CLOUD_ACCESS_KEY_ID / SECRET）")
+        return translate_texts_aliyun(texts, ak, sk)
+    try:
+        return translate_texts_lm(texts, url, model)
+    except urllib.error.URLError:
+        if ak and sk:
+            print("LM Studio 不可用，切换到阿里云机器翻译…")
+            return translate_texts_aliyun(texts, ak, sk)
+        raise
+    except Exception:
+        if ak and sk:
+            print("LM Studio 调用失败，切换到阿里云机器翻译…")
+            return translate_texts_aliyun(texts, ak, sk)
+        raise
+
+
 class Handler(BaseHTTPRequestHandler):
     ocr = None
     llm_url = "http://127.0.0.1:1234/v1"
     llm_model = ""
+    aliyun_ak = ""
+    aliyun_sk = ""
+    force_aliyun = False
     lock = threading.Lock()  # 同一时间只处理一张图
 
     def _send(self, code, body, ctype):
@@ -629,9 +726,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "请求为空或过大"})
         try:
             texts = json.loads(self.rfile.read(length))["texts"]
-            self._json(200, {"texts": translate_texts(texts, self.llm_url, self.llm_model)})
+            result = translate_texts(
+                texts,
+                self.llm_url,
+                self.llm_model,
+                ak=self.aliyun_ak,
+                sk=self.aliyun_sk,
+                force_aliyun=self.force_aliyun,
+            )
+            self._json(200, {"texts": result})
         except urllib.error.URLError as e:
-            self._json(502, {"error": f"连不上 LM Studio（{self.llm_url}），请确认已启动本地服务器：{e}"})
+            self._json(
+                502,
+                {
+                    "error": (
+                        f"连不上 LM Studio（{self.llm_url}），"
+                        + ("且阿里云回退失败" if (self.aliyun_ak and self.aliyun_sk) else "且未配置阿里云 AK/SK")
+                        + f"：{e}"
+                    )
+                },
+            )
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             self._json(500, {"error": str(e)})
@@ -647,6 +761,21 @@ def main():
     ap.add_argument("--lang", default="ch", help="识别语言，默认 ch（中文，含日英数字）；日文漫画可试 japan")
     ap.add_argument("--llm-url", default="http://127.0.0.1:1234/v1", help="LM Studio 本地服务器地址")
     ap.add_argument("--llm-model", default="", help="LM Studio 里的模型名；只加载了一个模型时可留空")
+    ap.add_argument(
+        "--aliyun-ak",
+        default=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", ""),
+        help="阿里云 AccessKey ID（也可用环境变量 ALIBABA_CLOUD_ACCESS_KEY_ID）",
+    )
+    ap.add_argument(
+        "--aliyun-sk",
+        default=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", ""),
+        help="阿里云 AccessKey Secret（也可用环境变量 ALIBABA_CLOUD_ACCESS_KEY_SECRET）",
+    )
+    ap.add_argument(
+        "--force-aliyun",
+        action="store_true",
+        help="强制使用阿里云机器翻译，不尝试 LM Studio",
+    )
     ap.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     args = ap.parse_args()
 
@@ -662,6 +791,19 @@ def main():
 
     Handler.llm_url = args.llm_url
     Handler.llm_model = args.llm_model
+    Handler.aliyun_ak = args.aliyun_ak
+    Handler.aliyun_sk = args.aliyun_sk
+    Handler.force_aliyun = args.force_aliyun
+
+    if args.force_aliyun:
+        if not (args.aliyun_ak and args.aliyun_sk):
+            raise SystemExit("已指定 --force-aliyun，但未提供 --aliyun-ak / --aliyun-sk")
+        print("翻译后端：阿里云机器翻译（强制）")
+    elif args.aliyun_ak and args.aliyun_sk:
+        print("翻译后端：优先 LM Studio，失败时回退阿里云机器翻译")
+    else:
+        print("翻译后端：仅 LM Studio（未配置阿里云 AK/SK）")
+
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}"
     print(f"就绪：{url}  （Ctrl+C 退出）")
